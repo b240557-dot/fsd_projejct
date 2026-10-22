@@ -3,3 +3,6 @@ uvicorn
 mysql-connector-python
 bcrypt
 pydantic
+python-dotenv
+itsdangerous
+groq
