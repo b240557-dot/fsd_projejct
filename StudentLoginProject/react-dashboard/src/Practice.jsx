@@ -1,10 +1,11 @@
 import { useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import { ArrowRight, Brain } from "lucide-react";
 import { api } from "./api";
 
 function Practice() {
   const navigate = useNavigate();
+  const location = useLocation();
   const [error, setError] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
 
@@ -15,6 +16,21 @@ function Practice() {
     const form = new FormData(event.currentTarget);
     const values = Object.fromEntries(form.entries());
     values.question_count = Number(values.question_count);
+    values.role = values.role.trim();
+    values.job_description = values.job_description.trim();
+    if (
+      location.state?.jobContext
+      && values.job_description === location.state.jobDescription
+    ) {
+      values.job_context = location.state.jobContext;
+    }
+    if (!values.role) delete values.role;
+    if (!values.job_description) delete values.job_description;
+    if (!values.role && !values.job_description) {
+      setError("Enter a role or paste a job description to continue.");
+      setIsSubmitting(false);
+      return;
+    }
 
     try {
       const interview = await api.generateQuestions(values);
@@ -30,11 +46,21 @@ function Practice() {
     <section className="content-card practice-card">
       <span className="eyebrow">AI INTERVIEW PRACTICE</span>
       <h1>Set up your interview</h1>
-      <p className="muted">Choose the role and format. The backend will generate questions and evaluate your answers.</p>
+      <p className="muted">Choose a role or paste a job description. The AI can use its requirements to tailor your questions and feedback.</p>
 
       <form className="practice-form" onSubmit={handleSubmit}>
         <label>Role or position
-          <input name="role" placeholder="e.g. Frontend Developer" minLength="2" maxLength="120" required />
+          <input name="role" placeholder="e.g. Frontend Developer" minLength="2" maxLength="120" />
+        </label>
+        <label>Job description (optional)
+          <textarea
+            name="job_description"
+            defaultValue={location.state?.jobDescription ?? ""}
+            placeholder="Paste a job description to analyze it and tailor this interview."
+            minLength="50"
+            maxLength="20000"
+            rows="5"
+          />
         </label>
         <div className="form-grid">
           <label>Interview type

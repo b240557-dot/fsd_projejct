@@ -1,8 +1,9 @@
 fastapi
 uvicorn
-mysql-connector-python
+pymongo
 bcrypt
 pydantic
 python-dotenv
 itsdangerous
 groq
+python-multipart

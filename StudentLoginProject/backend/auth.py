@@ -28,17 +28,17 @@ def get_current_user(request: Request) -> dict:
     except (BadSignature, SignatureExpired, KeyError, TypeError, ValueError) as error:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session expired. Please log in again.") from error
 
-    connection = get_db()
-    cursor = connection.cursor(dictionary=True)
-    try:
-        cursor.execute(
-            "SELECT id, fname, lname, username, email FROM users WHERE id = %s",
-            (user_id,),
-        )
-        user = cursor.fetchone()
-    finally:
-        cursor.close()
-        connection.close()
+    user = get_db().users.find_one(
+        {"id": user_id},
+        {
+            "_id": False,
+            "id": True,
+            "fname": True,
+            "lname": True,
+            "username": True,
+            "email": True,
+        },
+    )
 
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session is no longer valid.")

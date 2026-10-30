@@ -6,20 +6,20 @@ import uuid
 from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import httpx
+import mongomock
 from fastapi.testclient import TestClient
 from groq import APITimeoutError, AuthenticationError, RateLimitError
 
 import interview_service
 import main
 import config
-from database import get_db
 
 
 class InterviewWorkflowTests(unittest.TestCase):
-    def test_authenticated_workflow_persists_to_mysql(self):
+    def test_authenticated_workflow_persists_to_mongodb(self):
         suffix = uuid.uuid4().hex
         username = f"it_{suffix}"
         email = f"{suffix}@example.test"
@@ -27,8 +27,21 @@ class InterviewWorkflowTests(unittest.TestCase):
         other_email = f"other_{suffix}@example.test"
         created_user = False
         created_other_user = False
+        mongo_client = mongomock.MongoClient()
+        database = mongo_client["login_db"]
 
-        with TestClient(main.app) as client:
+        with (
+            patch.object(main, "get_db", return_value=database),
+            patch("auth.get_db", return_value=database),
+            patch.dict(
+                os.environ,
+                {
+                    "SESSION_SECRET": "test-session-secret-with-more-than-32-characters",
+                    "COOKIE_SECURE": "false",
+                },
+            ),
+            TestClient(main.app) as client,
+        ):
             try:
                 self.assertEqual(client.get("/").status_code, 200)
                 health = client.get("/health")
@@ -43,6 +56,13 @@ class InterviewWorkflowTests(unittest.TestCase):
                 )
                 self.assertIn("/api/ai/analyze-job-description", main.app.openapi()["paths"])
                 self.assertEqual(client.get("/interviews").status_code, 401)
+                self.assertEqual(
+                    client.post(
+                        "/api/interviews/transcribe",
+                        files={"file": ("answer.webm", b"\x1aE\xdf\xa3data", "audio/webm")},
+                    ).status_code,
+                    401,
+                )
                 self.assertEqual(
                     client.post(
                         "/api/ai/analyze-job-description",
@@ -90,6 +110,21 @@ class InterviewWorkflowTests(unittest.TestCase):
                 self.assertIn("httponly", login.headers["set-cookie"].lower())
                 self.assertIn("samesite=lax", login.headers["set-cookie"].lower())
                 self.assertEqual(client.get("/me").json()["user"]["username"], username)
+
+                with patch.object(main, "transcribe_audio", return_value="I would test the API.") as transcribe:
+                    transcript = client.post(
+                        "/api/interviews/transcribe",
+                        files={"file": ("answer.webm", b"\x1aE\xdf\xa3audio-bytes", "audio/webm")},
+                    )
+                self.assertEqual(transcript.status_code, 200, transcript.text)
+                self.assertEqual(transcript.json(), {"transcript": "I would test the API."})
+                transcribe.assert_called_once()
+
+                invalid_audio = client.post(
+                    "/api/interviews/transcribe",
+                    files={"file": ("answer.webm", b"not-audio", "audio/webm")},
+                )
+                self.assertEqual(invalid_audio.status_code, 415)
 
                 invalid_job_description = client.post(
                     "/api/ai/analyze-job-description",
@@ -157,19 +192,56 @@ class InterviewWorkflowTests(unittest.TestCase):
                 self.assertEqual(missing_key.status_code, 503)
                 self.assertIn("GROQ_API_KEY", missing_key.json()["detail"])
 
-                with patch.object(main, "generate_questions", return_value=["Question one?", "Question two?"]):
+                job_description = (
+                    "Software Engineer with Python and FastAPI experience. Design reliable APIs, "
+                    "write automated tests, and collaborate with product teams."
+                )
+                interview_analysis = {
+                    **job_analysis,
+                    "role_title": "Software Engineer",
+                }
+                with patch.object(
+                    main,
+                    "analyze_job_description",
+                    return_value=interview_analysis,
+                ) as analyze, patch.object(
+                    main,
+                    "generate_questions",
+                    return_value=["Question one?", "Question two?"],
+                ) as generate:
                     created = client.post(
                         "/api/ai/generate-questions",
                         json={
                             "role": "Software Engineer",
+                            "job_description": job_description,
                             "interview_type": "Technical",
                             "difficulty": "Intermediate",
                             "question_count": 2,
                         },
                     )
                 self.assertEqual(created.status_code, 201, created.text)
+                analyze.assert_called_once_with(job_description)
+                self.assertEqual(generate.call_args.kwargs["job_context"], interview_analysis)
                 interview_id = created.json()["id"]
                 question_ids = [item["id"] for item in created.json()["questions"]]
+
+                with patch.object(main, "analyze_job_description") as repeated_analysis, patch.object(
+                    main,
+                    "generate_questions",
+                    return_value=["A question based on analyzed requirements?"],
+                ):
+                    selected_analysis = client.post(
+                        "/interviews",
+                        json={
+                            "role": "Software Engineer",
+                            "job_context": interview_analysis,
+                            "interview_type": "Technical",
+                            "difficulty": "Intermediate",
+                            "question_count": 1,
+                        },
+                    )
+                self.assertEqual(selected_analysis.status_code, 201, selected_analysis.text)
+                repeated_analysis.assert_not_called()
 
                 out_of_order = client.post(
                     "/api/ai/evaluate-answer",
@@ -204,7 +276,11 @@ class InterviewWorkflowTests(unittest.TestCase):
                 }
                 with patch.object(main, "evaluate_candidate_answer", side_effect=evaluations), patch.object(
                     main, "generate_report", return_value=final_report
-                ):
+                ), patch.object(
+                    main,
+                    "generate_questions",
+                    return_value=["Adaptive follow-up question?"],
+                ) as generate_follow_up:
                     first = client.post(
                         "/api/ai/evaluate-answer",
                         json={
@@ -215,6 +291,10 @@ class InterviewWorkflowTests(unittest.TestCase):
                     )
                     self.assertEqual(first.status_code, 200, first.text)
                     self.assertIsNone(first.json()["report"])
+                    self.assertEqual(
+                        generate_follow_up.call_args.kwargs["previous_answers"][-1]["answer"],
+                        "My first answer.",
+                    )
 
                     second = client.post(
                         "/api/ai/evaluate-answer",
@@ -232,12 +312,13 @@ class InterviewWorkflowTests(unittest.TestCase):
                 self.assertEqual(detail.status_code, 200, detail.text)
                 self.assertEqual(detail.json()["interview"]["status"], "completed")
                 self.assertEqual(detail.json()["questions"][0]["answer_text"], "My first answer.")
+                self.assertEqual(detail.json()["questions"][1]["question_text"], "Adaptive follow-up question?")
                 self.assertEqual(detail.json()["questions"][0]["score"], 81)
                 self.assertEqual(detail.json()["questions"][0]["missing_concepts"], ["A measurable result"])
                 self.assertIn("measure coverage", detail.json()["questions"][0]["improved_answer"])
                 self.assertEqual(detail.json()["report"]["overall_score"], 87)
                 self.assertEqual(detail.json()["report"]["strengths"], ["Clear communication"])
-                self.assertEqual(len(client.get("/interviews").json()["interviews"]), 1)
+                self.assertEqual(len(client.get("/interviews").json()["interviews"]), 2)
 
                 with patch.object(main, "chat_reply", return_value="Use the STAR format."):
                     chat = client.post(
@@ -305,26 +386,37 @@ class InterviewWorkflowTests(unittest.TestCase):
                 self.assertEqual(client.get("/interviews").status_code, 401)
             finally:
                 if created_user or created_other_user:
-                    connection = get_db()
-                    cursor = connection.cursor()
-                    try:
-                        for test_username in (
-                            username if created_user else None,
-                            other_username if created_other_user else None,
-                        ):
-                            if not test_username:
-                                continue
-                            cursor.execute("SELECT id FROM users WHERE username = %s", (test_username,))
-                            user = cursor.fetchone()
-                            if user:
-                                cursor.execute("DELETE FROM interviews WHERE user_id = %s", (user[0],))
-                                cursor.execute("DELETE FROM users WHERE id = %s", (user[0],))
-                            cursor.execute("SELECT COUNT(*) FROM users WHERE username = %s", (test_username,))
-                            self.assertEqual(cursor.fetchone()[0], 0)
-                        connection.commit()
-                    finally:
-                        cursor.close()
-                        connection.close()
+                    for test_username in (
+                        username if created_user else None,
+                        other_username if created_other_user else None,
+                    ):
+                        if not test_username:
+                            continue
+                        test_user = database.users.find_one(
+                            {"username_key": test_username.casefold()}
+                        )
+                        if test_user:
+                            interview_ids = [
+                                interview["id"]
+                                for interview in database.interviews.find(
+                                    {"user_id": test_user["id"]},
+                                    {"id": True},
+                                )
+                            ]
+                            database.interview_questions.delete_many(
+                                {"interview_id": {"$in": interview_ids}}
+                            )
+                            database.interview_reports.delete_many(
+                                {"interview_id": {"$in": interview_ids}}
+                            )
+                            database.interviews.delete_many({"user_id": test_user["id"]})
+                            database.users.delete_one({"id": test_user["id"]})
+                        self.assertIsNone(
+                            database.users.find_one(
+                                {"username_key": test_username.casefold()}
+                            )
+                        )
+                mongo_client.close()
 
 
 class GroqServiceTests(unittest.TestCase):
@@ -446,6 +538,30 @@ class GroqServiceTests(unittest.TestCase):
         self.assertEqual(report["overall_score"], 88)
         self.assertEqual(report["strengths"], ["Clear examples"])
         self.assertIn("clarifying questions", reply)
+
+    def test_audio_transcription_uses_groq_stt_model(self):
+        create_transcription = Mock(return_value=SimpleNamespace(text="  Spoken response.  "))
+        client = SimpleNamespace(
+            audio=SimpleNamespace(
+                transcriptions=SimpleNamespace(create=create_transcription),
+            )
+        )
+        audio = b"\x1aE\xdf\xa3recording-data"
+
+        with patch.object(interview_service, "_client", return_value=client), patch.object(
+            interview_service,
+            "_setting",
+            return_value="",
+        ):
+            transcript = interview_service.transcribe_audio("answer.webm", audio, "audio/webm")
+
+        self.assertEqual(transcript, "Spoken response.")
+        create_transcription.assert_called_once_with(
+            file=("answer.webm", audio, "audio/webm"),
+            model="whisper-large-v3-turbo",
+            response_format="json",
+            timeout=60.0,
+        )
 
     def test_missing_groq_key_has_clear_configuration_error(self):
         with patch.dict(os.environ, {"GROQ_API_KEY": "", "GROQ_MODEL": "test-model"}):

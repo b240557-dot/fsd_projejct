@@ -1,17 +1,19 @@
 import json
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Literal, NoReturn
 
 import bcrypt
-import mysql.connector
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, field_validator
+from pymongo import ASCENDING, DESCENDING
+from pymongo.errors import DuplicateKeyError, PyMongoError
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from config import load_backend_environment
 from auth import SESSION_COOKIE, create_session, get_current_user
-from database import get_db
+from database import close_mongo_client, get_db, next_id
 from interview_service import (
     AIServiceError,
     analyze_job_description,
@@ -19,6 +21,7 @@ from interview_service import (
     evaluate_answer as evaluate_candidate_answer,
     generate_questions,
     generate_report,
+    transcribe_audio,
 )
 from security import ensure_session_secret
 
@@ -26,131 +29,29 @@ from security import ensure_session_secret
 load_backend_environment()
 
 
-def ensure_column(cursor, table: str, column: str, definition: str):
-    cursor.execute(
-        """
-        SELECT COUNT(*)
-        FROM information_schema.COLUMNS
-        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND COLUMN_NAME = %s
-        """,
-        (table, column),
+def initialize_database():
+    database = get_db()
+    database.users.create_index([("id", ASCENDING)], unique=True)
+    database.users.create_index([("username_key", ASCENDING)], unique=True)
+    database.users.create_index([("email_key", ASCENDING)], unique=True)
+    database.interviews.create_index([("id", ASCENDING)], unique=True)
+    database.interviews.create_index([("user_id", ASCENDING), ("created_at", DESCENDING)])
+    database.interview_questions.create_index([("id", ASCENDING)], unique=True)
+    database.interview_questions.create_index(
+        [("interview_id", ASCENDING), ("id", ASCENDING)]
     )
-    if cursor.fetchone()[0] == 0:
-        cursor.execute(f"ALTER TABLE `{table}` ADD COLUMN `{column}` {definition}")
-
-
-def initialize_interview_tables():
-    connection = get_db()
-    cursor = connection.cursor()
-    try:
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS interviews (
-                id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-                user_id INT NOT NULL,
-                role VARCHAR(120) NOT NULL,
-                interview_type VARCHAR(30) NOT NULL,
-                difficulty VARCHAR(30) NOT NULL,
-                status VARCHAR(20) NOT NULL DEFAULT 'in_progress',
-                total_score DECIMAL(5, 2) NULL,
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-                    ON UPDATE CURRENT_TIMESTAMP,
-                CONSTRAINT fk_interviews_user
-                    FOREIGN KEY (user_id) REFERENCES users(id)
-                    ON DELETE CASCADE,
-                INDEX idx_interviews_user_created (user_id, created_at)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """
-        )
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS interview_questions (
-                id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-                interview_id BIGINT NOT NULL,
-                question_text TEXT NOT NULL,
-                answer_text LONGTEXT NULL,
-                feedback LONGTEXT NULL,
-                score DECIMAL(5, 2) NULL,
-                missing_concepts LONGTEXT NULL,
-                improved_answer LONGTEXT NULL,
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                CONSTRAINT fk_questions_interview
-                    FOREIGN KEY (interview_id) REFERENCES interviews(id)
-                    ON DELETE CASCADE,
-                INDEX idx_questions_interview (interview_id)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """
-        )
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS interview_reports (
-                id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-                interview_id BIGINT NOT NULL UNIQUE,
-                overall_score DECIMAL(5, 2) NOT NULL,
-                overall_feedback LONGTEXT NOT NULL,
-                report_json LONGTEXT NULL,
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                CONSTRAINT fk_reports_interview
-                    FOREIGN KEY (interview_id) REFERENCES interviews(id)
-                    ON DELETE CASCADE
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """
-        )
-        ensure_column(cursor, "interview_questions", "missing_concepts", "LONGTEXT NULL")
-        ensure_column(cursor, "interview_questions", "improved_answer", "LONGTEXT NULL")
-        ensure_column(cursor, "interview_questions", "feedback", "LONGTEXT NULL")
-        ensure_column(cursor, "interview_reports", "report_json", "LONGTEXT NULL")
-        cursor.execute(
-            """
-            SELECT COUNT(*)
-            FROM information_schema.TABLE_CONSTRAINTS
-            WHERE CONSTRAINT_SCHEMA = DATABASE()
-              AND TABLE_NAME = 'interviews'
-              AND CONSTRAINT_NAME = 'fk_interviews_user'
-              AND CONSTRAINT_TYPE = 'FOREIGN KEY'
-            """
-        )
-        if cursor.fetchone()[0] == 0:
-            cursor.execute(
-                """
-                ALTER TABLE interviews
-                ADD CONSTRAINT fk_interviews_user
-                    FOREIGN KEY (user_id) REFERENCES users(id)
-                    ON DELETE CASCADE
-                """
-            )
-        cursor.execute(
-            """
-            SELECT DATA_TYPE
-            FROM information_schema.COLUMNS
-            WHERE TABLE_SCHEMA = DATABASE()
-              AND TABLE_NAME = 'interview_reports'
-              AND COLUMN_NAME = 'overall_feedback'
-            """
-        )
-        feedback_type = cursor.fetchone()[0]
-        if feedback_type != "longtext":
-            cursor.execute(
-                """
-                ALTER TABLE interview_reports
-                MODIFY COLUMN overall_feedback LONGTEXT NOT NULL
-                """
-            )
-        connection.commit()
-    except mysql.connector.Error:
-        connection.rollback()
-        raise
-    finally:
-        cursor.close()
-        connection.close()
+    database.interview_reports.create_index([("id", ASCENDING)], unique=True)
+    database.interview_reports.create_index([("interview_id", ASCENDING)], unique=True)
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     ensure_session_secret()
-    initialize_interview_tables()
-    yield
+    try:
+        initialize_database()
+        yield
+    finally:
+        close_mongo_client()
 
 
 app = FastAPI(title="AI Interview Platform API", lifespan=lifespan)
@@ -203,11 +104,50 @@ class LoginData(BaseModel):
         return value
 
 
+class JobDescriptionAnalysis(BaseModel):
+    role_title: str
+    seniority: str
+    summary: str
+    required_skills: list[str]
+    preferred_skills: list[str]
+    qualifications: list[str]
+    responsibilities: list[str]
+    interview_focus: list[str]
+
+
 class InterviewCreateData(BaseModel):
-    role: str = Field(min_length=2, max_length=120)
+    role: str | None = Field(default=None, min_length=2, max_length=120)
     interview_type: Literal["Technical", "HR", "Behavioral", "Mixed"]
     difficulty: Literal["Beginner", "Intermediate", "Advanced"]
     question_count: int = Field(default=5, ge=1, le=10)
+    job_description: str | None = Field(default=None, min_length=50, max_length=20000)
+    job_context: JobDescriptionAnalysis | None = None
+
+    @model_validator(mode="after")
+    def role_or_job_description_required(self):
+        has_role = bool(self.role and self.role.strip())
+        has_description = bool(self.job_description and self.job_description.strip())
+        analyzed_role = (
+            self.job_context.role_title.strip()
+            if self.job_context and self.job_context.role_title.strip().casefold() != "not specified"
+            else ""
+        )
+        if not (has_role or has_description or analyzed_role):
+            raise ValueError("Provide a role or a job description.")
+        return self
+
+    @field_validator("job_description")
+    @classmethod
+    def job_description_is_not_blank(cls, value: str | None) -> str | None:
+        if value is not None:
+            value = value.strip()
+            if len(value) < 50:
+                raise ValueError("Job description must contain at least 50 non-whitespace characters.")
+        return value
+
+
+class TranscriptionResponse(BaseModel):
+    transcript: str
 
 
 class JobDescriptionData(BaseModel):
@@ -220,17 +160,6 @@ class JobDescriptionData(BaseModel):
         if len(value) < 50:
             raise ValueError("Job description must contain at least 50 non-whitespace characters.")
         return value
-
-
-class JobDescriptionAnalysis(BaseModel):
-    role_title: str
-    seniority: str
-    summary: str
-    required_skills: list[str]
-    preferred_skills: list[str]
-    qualifications: list[str]
-    responsibilities: list[str]
-    interview_focus: list[str]
 
 
 class AnswerData(BaseModel):
@@ -316,71 +245,56 @@ def analyze_job_description_endpoint(data: JobDescriptionData):
 
 @app.post("/signup", status_code=status.HTTP_201_CREATED)
 def signup(data: SignupData):
-    connection = get_db()
-    cursor = connection.cursor()
+    database = get_db()
+    username = data.username.strip()
+    email = data.email.strip().lower()
+    password_hash = bcrypt.hashpw(
+        data.password.encode("utf-8"),
+        bcrypt.gensalt(),
+    ).decode("utf-8")
     try:
-        cursor.execute(
-            "SELECT id FROM users WHERE username = %s OR email = %s",
-            (data.username, data.email),
+        existing = database.users.find_one(
+            {
+                "$or": [
+                    {"username_key": username.casefold()},
+                    {"email_key": email.casefold()},
+                ]
+            },
+            {"_id": False},
         )
-        existing = cursor.fetchone()
         if existing:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Username or email already exists.",
             )
 
-        password_hash = bcrypt.hashpw(
-            data.password.encode("utf-8"),
-            bcrypt.gensalt(),
-        ).decode("utf-8")
-        cursor.execute(
-            """
-            INSERT INTO users (fname, lname, username, password, email, contact)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            """,
-            (
-                data.fname.strip(),
-                data.lname.strip(),
-                data.username.strip(),
-                password_hash,
-                data.email.strip().lower(),
-                data.contact,
-            ),
+        database.users.insert_one(
+            {
+                "id": next_id(database, "users"),
+                "fname": data.fname.strip(),
+                "lname": data.lname.strip(),
+                "username": username,
+                "username_key": username.casefold(),
+                "password": password_hash,
+                "email": email,
+                "email_key": email.casefold(),
+                "contact": data.contact,
+            }
         )
-        connection.commit()
-        return {"success": True, "message": "Registration successful"}
-    except mysql.connector.IntegrityError as error:
-        connection.rollback()
+    except DuplicateKeyError as error:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Username or email already exists.",
         ) from error
-    except mysql.connector.Error:
-        connection.rollback()
-        raise
-    finally:
-        cursor.close()
-        connection.close()
+    return {"success": True, "message": "Registration successful"}
 
 
 @app.post("/login")
 def login(data: LoginData, response: Response):
-    connection = get_db()
-    cursor = connection.cursor(dictionary=True)
-    try:
-        cursor.execute(
-            """
-            SELECT id, fname, lname, username, email, password
-            FROM users
-            WHERE username = %s
-            """,
-            (data.username.strip(),),
-        )
-        account = cursor.fetchone()
-    finally:
-        cursor.close()
-        connection.close()
+    account = get_db().users.find_one(
+        {"username_key": data.username.strip().casefold()},
+        {"_id": False},
+    )
 
     password_hash = account["password"].encode("utf-8") if account else DUMMY_PASSWORD_HASH
     if not bcrypt.checkpw(data.password.encode("utf-8"), password_hash):
@@ -421,85 +335,193 @@ def create_interview(
     data: InterviewCreateData,
     user: dict = Depends(get_current_user),
 ):
+    job_context = data.job_context.model_dump() if data.job_context else None
+    role = data.role.strip() if data.role else ""
+    if data.job_description and not job_context:
+        try:
+            job_context = analyze_job_description(data.job_description)
+        except AIServiceError as error:
+            raise_ai_http_error(error)
+    if job_context and (not role or job_context["role_title"].casefold() != "not specified"):
+        role = job_context["role_title"]
+
     try:
         questions = generate_questions(
-            role=data.role.strip(),
+            role=role,
             interview_type=data.interview_type,
             difficulty=data.difficulty,
             count=data.question_count,
+            job_context=job_context,
         )
     except AIServiceError as error:
         raise_ai_http_error(error)
 
-    connection = get_db()
-    cursor = connection.cursor()
-    try:
-        cursor.execute(
-            """
-            INSERT INTO interviews (user_id, role, interview_type, difficulty)
-            VALUES (%s, %s, %s, %s)
-            """,
-            (user["id"], data.role.strip(), data.interview_type, data.difficulty),
-        )
-        interview_id = cursor.lastrowid
-        inserted_questions = []
-        for question in questions:
-            cursor.execute(
-                "INSERT INTO interview_questions (interview_id, question_text) VALUES (%s, %s)",
-                (interview_id, question),
-            )
-            inserted_questions.append({"id": cursor.lastrowid, "question": question})
-        connection.commit()
-        return {
-            "id": interview_id,
+    database = get_db()
+    now = datetime.now(timezone.utc)
+    interview_id = next_id(database, "interviews")
+    interview = {
+        "id": interview_id,
+        "user_id": user["id"],
+        "role": role,
+        "interview_type": data.interview_type,
+        "difficulty": data.difficulty,
+        "status": "in_progress",
+        "current_difficulty": data.difficulty,
+        "total_score": None,
+        "created_at": now,
+        "updated_at": now,
+    }
+    if job_context:
+        interview["job_context"] = job_context
+    question_documents = [
+        {
+            "id": next_id(database, "interview_questions"),
             "interview_id": interview_id,
-            "role": data.role.strip(),
-            "interview_type": data.interview_type,
-            "difficulty": data.difficulty,
-            "status": "in_progress",
-            "questions": inserted_questions,
+            "question_text": question,
+            "answer_text": None,
+            "feedback": None,
+            "score": None,
+            "missing_concepts": [],
+            "improved_answer": None,
+            "created_at": now,
         }
-    except mysql.connector.Error:
-        connection.rollback()
+        for question in questions
+    ]
+
+    database.interviews.insert_one(interview)
+    try:
+        if question_documents:
+            database.interview_questions.insert_many(question_documents)
+    except PyMongoError:
+        database.interviews.delete_one({"id": interview_id})
+        database.interview_questions.delete_many({"interview_id": interview_id})
         raise
+
+    return {
+        "id": interview_id,
+        "interview_id": interview_id,
+        "role": role,
+        "interview_type": interview["interview_type"],
+        "difficulty": interview["difficulty"],
+        "status": interview["status"],
+        "questions": [
+            {"id": item["id"], "question": item["question_text"]}
+            for item in question_documents
+        ],
+    }
+
+
+MAX_AUDIO_BYTES = 20 * 1024 * 1024
+SUPPORTED_AUDIO_TYPES = {
+    "audio/webm",
+    "audio/ogg",
+    "audio/wav",
+    "audio/x-wav",
+    "audio/mpeg",
+    "audio/mp3",
+    "audio/mp4",
+    "audio/aac",
+}
+
+
+def has_audio_signature(audio: bytes, content_type: str) -> bool:
+    if content_type in {"audio/webm", "audio/webm;codecs=opus"}:
+        return audio.startswith(b"\x1aE\xdf\xa3")
+    if content_type == "audio/ogg":
+        return audio.startswith(b"OggS")
+    if content_type in {"audio/wav", "audio/x-wav"}:
+        return audio.startswith(b"RIFF") and audio[8:12] == b"WAVE"
+    if content_type in {"audio/mpeg", "audio/mp3"}:
+        return audio.startswith(b"ID3") or (
+            len(audio) > 1 and audio[0] == 0xFF and audio[1] & 0xE0 == 0xE0
+        )
+    if content_type == "audio/mp4":
+        return len(audio) >= 8 and audio[4:8] == b"ftyp"
+    if content_type == "audio/aac":
+        return len(audio) > 1 and audio[0] == 0xFF and audio[1] & 0xF6 == 0xF0
+    return False
+
+
+@app.post("/api/interviews/transcribe", response_model=TranscriptionResponse)
+async def transcribe_interview_answer(
+    file: UploadFile = File(...),
+    _user: dict = Depends(get_current_user),
+):
+    try:
+        content_type = (file.content_type or "").split(";", maxsplit=1)[0].strip().lower()
+        if content_type not in SUPPORTED_AUDIO_TYPES:
+            raise HTTPException(
+                status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+                detail="Upload a WebM, Ogg, WAV, MP3, MP4, or AAC audio recording.",
+            )
+
+        audio = await file.read(MAX_AUDIO_BYTES + 1)
+        if not audio:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="The audio recording is empty.")
+        if len(audio) > MAX_AUDIO_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail="Audio recordings must be 20 MB or smaller.",
+            )
+        if not has_audio_signature(audio, content_type):
+            raise HTTPException(
+                status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+                detail="The uploaded file does not contain a supported audio recording.",
+            )
+
+        extension = {
+            "audio/webm": "webm",
+            "audio/ogg": "ogg",
+            "audio/wav": "wav",
+            "audio/x-wav": "wav",
+            "audio/mpeg": "mp3",
+            "audio/mp3": "mp3",
+            "audio/mp4": "mp4",
+            "audio/aac": "aac",
+        }[content_type]
+        try:
+            transcript = transcribe_audio(
+                f"recording.{extension}",
+                audio,
+                content_type,
+            )
+        except AIServiceError as error:
+            raise_ai_http_error(error)
+        return {"transcript": transcript}
     finally:
-        cursor.close()
-        connection.close()
+        await file.close()
 
 
 @app.get("/interviews")
 def interview_history(user: dict = Depends(get_current_user)):
-    connection = get_db()
-    cursor = connection.cursor(dictionary=True)
-    try:
-        cursor.execute(
-            """
-            SELECT i.id, i.role, i.interview_type, i.difficulty, i.status,
-                   i.total_score, i.created_at, COUNT(q.id) AS question_count
-            FROM interviews AS i
-            LEFT JOIN interview_questions AS q ON q.interview_id = i.id
-            WHERE i.user_id = %s
-            GROUP BY i.id
-            ORDER BY i.created_at DESC
-            """,
-            (user["id"],),
-        )
-        return {"interviews": cursor.fetchall()}
-    finally:
-        cursor.close()
-        connection.close()
-
-
-def load_interview(cursor, interview_id: int, user_id: int, lock: bool = False):
-    cursor.execute(
-        """
-        SELECT id, role, interview_type, difficulty, status, total_score, created_at
-        FROM interviews
-        WHERE id = %s AND user_id = %s
-        """ + (" FOR UPDATE" if lock else ""),
-        (interview_id, user_id),
+    database = get_db()
+    interviews = list(
+        database.interviews.find(
+            {"user_id": user["id"]},
+            {
+                "_id": False,
+                "id": True,
+                "role": True,
+                "interview_type": True,
+                "difficulty": True,
+                "status": True,
+                "total_score": True,
+                "created_at": True,
+            },
+        ).sort("created_at", DESCENDING)
     )
-    interview = cursor.fetchone()
+    for interview in interviews:
+        interview["question_count"] = database.interview_questions.count_documents(
+            {"interview_id": interview["id"]}
+        )
+    return {"interviews": interviews}
+
+
+def load_interview(database, interview_id: int, user_id: int):
+    interview = database.interviews.find_one(
+        {"id": interview_id, "user_id": user_id},
+        {"_id": False},
+    )
     if interview is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interview not found.")
     return interview
@@ -510,38 +532,24 @@ def interview_detail(
     interview_id: int,
     user: dict = Depends(get_current_user),
 ):
-    connection = get_db()
-    cursor = connection.cursor(dictionary=True)
-    try:
-        interview = load_interview(cursor, interview_id, user["id"])
-        cursor.execute(
-            """
-            SELECT id, question_text, answer_text, feedback, score,
-                   missing_concepts, improved_answer
-            FROM interview_questions
-            WHERE interview_id = %s
-            ORDER BY id
-            """,
-            (interview_id,),
-        )
-        questions = cursor.fetchall()
-        for question in questions:
-            question["missing_concepts"] = json.loads(question["missing_concepts"] or "[]")
-        cursor.execute(
-            """
-            SELECT overall_score, overall_feedback, report_json, created_at
-            FROM interview_reports
-            WHERE interview_id = %s
-            """,
-            (interview_id,),
-        )
-        report = cursor.fetchone()
-        if report and report["report_json"]:
-            report = json.loads(report["report_json"])
-        return {"interview": interview, "questions": questions, "report": report}
-    finally:
-        cursor.close()
-        connection.close()
+    database = get_db()
+    interview = load_interview(database, interview_id, user["id"])
+    questions = list(
+        database.interview_questions.find(
+            {"interview_id": interview_id},
+            {"_id": False},
+        ).sort("id", ASCENDING)
+    )
+    report_document = database.interview_reports.find_one(
+        {"interview_id": interview_id},
+        {"_id": False},
+    )
+    report = (
+        report_document.get("report_json") or report_document
+        if report_document
+        else None
+    )
+    return {"interview": interview, "questions": questions, "report": report}
 
 
 @app.post("/interviews/{interview_id}/answers")
@@ -562,33 +570,24 @@ def evaluate_answer_endpoint(
 
 
 def evaluate_and_save_answer(interview_id: int, data: AnswerData, user: dict):
-    connection = get_db()
-    cursor = connection.cursor(dictionary=True)
-    try:
-        interview = load_interview(cursor, interview_id, user["id"])
-        if interview["status"] != "in_progress":
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="This interview is complete.")
+    database = get_db()
+    interview = load_interview(database, interview_id, user["id"])
+    if interview["status"] != "in_progress":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="This interview is complete.")
 
-        cursor.execute(
-            """
-            SELECT id, question_text, answer_text
-            FROM interview_questions
-            WHERE interview_id = %s
-            ORDER BY id
-            """,
-            (interview_id,),
+    questions = list(
+        database.interview_questions.find(
+            {"interview_id": interview_id},
+            {"_id": False},
+        ).sort("id", ASCENDING)
+    )
+    next_question = next((item for item in questions if item["answer_text"] is None), None)
+    if next_question is None or next_question["id"] != data.question_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Answer the current unanswered question before continuing.",
         )
-        questions = cursor.fetchall()
-        next_question = next((item for item in questions if item["answer_text"] is None), None)
-        if next_question is None or next_question["id"] != data.question_id:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Answer the current unanswered question before continuing.",
-            )
-        question = next_question
-    finally:
-        cursor.close()
-        connection.close()
+    question = next_question
 
     try:
         evaluation = evaluate_candidate_answer(
@@ -596,112 +595,184 @@ def evaluate_and_save_answer(interview_id: int, data: AnswerData, user: dict):
             interview_type=interview["interview_type"],
             question=question["question_text"],
             answer=data.answer.strip(),
+            job_context=interview.get("job_context"),
         )
     except AIServiceError as error:
         raise_ai_http_error(error)
 
-    connection = get_db()
-    cursor = connection.cursor(dictionary=True)
-    try:
-        interview = load_interview(cursor, interview_id, user["id"], lock=True)
-        if interview["status"] != "in_progress":
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="This interview is complete.")
+    remaining_questions = [
+        item
+        for item in questions
+        if item["id"] != data.question_id and item["answer_text"] is None
+    ]
+    next_difficulty = interview.get("current_difficulty", interview["difficulty"])
+    if evaluation["score"] >= 85:
+        next_difficulty = {
+            "Beginner": "Intermediate",
+            "Intermediate": "Advanced",
+            "Advanced": "Advanced",
+        }[next_difficulty]
+    elif evaluation["score"] <= 60:
+        next_difficulty = {
+            "Beginner": "Beginner",
+            "Intermediate": "Beginner",
+            "Advanced": "Intermediate",
+        }[next_difficulty]
 
-        cursor.execute(
-            """
-            SELECT id, question_text, answer_text
-            FROM interview_questions
-            WHERE id = %s AND interview_id = %s
-            """,
-            (data.question_id, interview_id),
+    adaptive_question = None
+    if remaining_questions:
+        previous_answers = [
+            {
+                "question": item["question_text"],
+                "answer": item["answer_text"],
+                "score": item["score"],
+                "feedback": item["feedback"],
+            }
+            for item in questions
+            if item["answer_text"] is not None
+        ]
+        previous_answers.append(
+            {
+                "question": question["question_text"],
+                "answer": data.answer.strip(),
+                "score": evaluation["score"],
+                "feedback": evaluation["feedback"],
+            }
         )
-        question = cursor.fetchone()
-        if question is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Question not found.")
-        if question["answer_text"] is not None:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="This question was already answered.")
+        try:
+            adaptive_question = generate_questions(
+                role=interview["role"],
+                interview_type=interview["interview_type"],
+                difficulty=next_difficulty,
+                count=1,
+                job_context=interview.get("job_context"),
+                previous_answers=previous_answers,
+            )[0]
+        except AIServiceError as error:
+            raise_ai_http_error(error)
 
-        cursor.execute(
-            """
-            UPDATE interview_questions
-            SET answer_text = %s, feedback = %s, score = %s,
-                missing_concepts = %s, improved_answer = %s
-            WHERE id = %s AND answer_text IS NULL
-            """,
-            (
-                data.answer.strip(),
-                evaluation["feedback"],
-                evaluation["score"],
-                json.dumps(evaluation["missing_concepts"]),
-                evaluation["improved_answer"],
-                question["id"],
-            ),
+    interview = load_interview(database, interview_id, user["id"])
+    if interview["status"] != "in_progress":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="This interview is complete.")
+
+    questions = list(
+        database.interview_questions.find(
+            {"interview_id": interview_id},
+            {"_id": False},
+        ).sort("id", ASCENDING)
+    )
+    next_question = next((item for item in questions if item["answer_text"] is None), None)
+    if next_question is None or next_question["id"] != data.question_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This question was already answered or is no longer current.",
         )
-        cursor.execute(
-            """
-            SELECT question_text, answer_text, score, feedback, missing_concepts
-            FROM interview_questions
-            WHERE interview_id = %s
-            ORDER BY id
-            """,
-            (interview_id,),
-        )
-        answers = cursor.fetchall()
-        total_questions = len(answers)
-        answered = [item for item in answers if item["score"] is not None]
-        report = None
-        if total_questions and len(answered) == total_questions:
-            report_answers = [
-                {
-                    "question": item["question_text"],
-                    "answer": item["answer_text"],
-                    "score": round(float(item["score"])),
-                    "feedback": item["feedback"],
-                    "missing_concepts": json.loads(item["missing_concepts"] or "[]"),
-                }
-                for item in answered
-            ]
-            try:
-                report = generate_report(
-                    role=interview["role"],
-                    interview_type=interview["interview_type"],
-                    answers=report_answers,
-                )
-            except AIServiceError as error:
-                raise_ai_http_error(error)
-            cursor.execute(
-                "UPDATE interviews SET status = 'completed', total_score = %s WHERE id = %s",
-                (report["overall_score"], interview_id),
-            )
-            cursor.execute(
-                """
-                INSERT INTO interview_reports
-                    (interview_id, overall_score, overall_feedback, report_json)
-                VALUES (%s, %s, %s, %s)
-                """,
-                (
-                    interview_id,
-                    report["overall_score"],
-                    report["summary"],
-                    json.dumps(report, ensure_ascii=True),
+
+    report = None
+    total_questions = len(questions)
+    answered_before = [item for item in questions if item["score"] is not None]
+    if total_questions and len(answered_before) + 1 == total_questions:
+        report_answers = [
+            {
+                "question": item["question_text"],
+                "answer": data.answer.strip() if item["id"] == data.question_id else item["answer_text"],
+                "score": round(float(evaluation["score"] if item["id"] == data.question_id else item["score"])),
+                "feedback": evaluation["feedback"] if item["id"] == data.question_id else item["feedback"],
+                "missing_concepts": (
+                    evaluation["missing_concepts"]
+                    if item["id"] == data.question_id
+                    else item["missing_concepts"]
                 ),
+            }
+            for item in questions
+        ]
+        try:
+            report = generate_report(
+                role=interview["role"],
+                interview_type=interview["interview_type"],
+                answers=report_answers,
+                job_context=interview.get("job_context"),
             )
-        connection.commit()
-        return {
-            "evaluation": evaluation,
-            "answered": len(answered),
-            "total": total_questions,
-            "report": report,
+        except AIServiceError as error:
+            raise_ai_http_error(error)
+
+    updated_question = database.interview_questions.update_one(
+        {
+            "id": data.question_id,
+            "interview_id": interview_id,
+            "answer_text": None,
+        },
+        {
+            "$set": {
+                "answer_text": data.answer.strip(),
+                "feedback": evaluation["feedback"],
+                "score": evaluation["score"],
+                "missing_concepts": evaluation["missing_concepts"],
+                "improved_answer": evaluation["improved_answer"],
+            }
+        },
+    )
+    if updated_question.modified_count != 1:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This question was already answered.",
+        )
+
+    if adaptive_question and remaining_questions:
+        next_pending = remaining_questions[0]
+        database.interview_questions.update_one(
+            {
+                "id": next_pending["id"],
+                "interview_id": interview_id,
+                "answer_text": None,
+            },
+            {"$set": {"question_text": adaptive_question, "difficulty": next_difficulty}},
+        )
+        database.interviews.update_one(
+            {"id": interview_id, "user_id": user["id"], "status": "in_progress"},
+            {"$set": {"current_difficulty": next_difficulty}},
+        )
+
+    answers = list(
+        database.interview_questions.find(
+            {"interview_id": interview_id},
+            {"_id": False},
+        ).sort("id", ASCENDING)
+    )
+    answered = [item for item in answers if item["score"] is not None]
+    if report:
+        report_document = {
+            "id": next_id(database, "interview_reports"),
+            "interview_id": interview_id,
+            "overall_score": report["overall_score"],
+            "overall_feedback": report["summary"],
+            "report_json": report,
+            "created_at": datetime.now(timezone.utc),
         }
-    except HTTPException:
-        connection.rollback()
-        raise
-    except mysql.connector.Error:
-        connection.rollback()
-        raise
-    finally:
-        cursor.close()
-        connection.close()
+        database.interview_reports.insert_one(report_document)
+        completion = database.interviews.update_one(
+            {"id": interview_id, "user_id": user["id"], "status": "in_progress"},
+            {
+                "$set": {
+                    "status": "completed",
+                    "total_score": report["overall_score"],
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            },
+        )
+        if completion.modified_count != 1:
+            database.interview_reports.delete_one({"id": report_document["id"]})
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This interview is complete.",
+            )
+
+    return {
+        "evaluation": evaluation,
+        "answered": len(answered),
+        "total": total_questions,
+        "report": report,
+    }
 
 
 @app.post("/api/ai/chat")
@@ -711,32 +782,29 @@ def interview_chat(
 ):
     interview_context = None
     if data.interview_id is not None:
-        connection = get_db()
-        cursor = connection.cursor(dictionary=True)
-        try:
-            interview = load_interview(cursor, data.interview_id, user["id"])
-            cursor.execute(
-                """
-                SELECT question_text, answer_text, score, feedback
-                FROM interview_questions
-                WHERE interview_id = %s AND answer_text IS NOT NULL
-                ORDER BY id
-                """,
-                (data.interview_id,),
-            )
-            answered = cursor.fetchall()
-            interview_context = json.dumps(
+        database = get_db()
+        interview = load_interview(database, data.interview_id, user["id"])
+        answered = list(
+            database.interview_questions.find(
+                {"interview_id": data.interview_id, "answer_text": {"$ne": None}},
                 {
-                    "role": interview["role"],
-                    "interview_type": interview["interview_type"],
-                    "completed_answers": answered,
+                    "_id": False,
+                    "question_text": True,
+                    "answer_text": True,
+                    "score": True,
+                    "feedback": True,
                 },
-                ensure_ascii=True,
-                default=str,
-            )
-        finally:
-            cursor.close()
-            connection.close()
+            ).sort("id", ASCENDING)
+        )
+        interview_context = json.dumps(
+            {
+                "role": interview["role"],
+                "interview_type": interview["interview_type"],
+                "completed_answers": answered,
+            },
+            ensure_ascii=True,
+            default=str,
+        )
 
     try:
         reply = chat_reply(

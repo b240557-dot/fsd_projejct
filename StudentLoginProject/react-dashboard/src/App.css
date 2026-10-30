@@ -596,6 +596,123 @@
   letter-spacing: 1px;
 }
 
+.interview-progress {
+  display: block;
+  width: 100%;
+  height: 7px;
+  margin: 14px 0 20px;
+  overflow: hidden;
+  accent-color: var(--purple);
+}
+
+.interview-modes {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  margin-top: 20px;
+}
+
+.interview-modes fieldset {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+  min-width: 0;
+  margin: 0;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+.interview-modes legend {
+  padding: 0 5px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.interview-modes label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--ink);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.interview-modes input {
+  accent-color: var(--purple);
+}
+
+.speech-controls,
+.voice-answer-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 9px;
+  margin-top: 16px;
+}
+
+.playback-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.playback-status.is-speaking {
+  color: var(--purple);
+}
+
+.secondary-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 38px;
+  padding: 8px 12px;
+  color: var(--purple);
+  background: #f3f0ff;
+  border: 1px solid #e6e0fa;
+  border-radius: 8px;
+  font: 600 12px "DM Sans", sans-serif;
+  cursor: pointer;
+}
+
+.secondary-btn:hover:not(:disabled) {
+  background: #eae5ff;
+}
+
+.secondary-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.voice-answer-panel {
+  display: grid;
+  gap: 10px;
+  padding: 16px;
+  background: #fbfaff;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+.voice-answer-panel > .muted {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.recording-button {
+  color: #a42a3c;
+  background: #fff0f1;
+  border-color: #f5d6da;
+}
+
+.recording-button:hover:not(:disabled) {
+  background: #ffe4e7;
+}
+
 .question-panel > .markdown-content,
 .evaluation-panel > .markdown-content,
 .report-panel > .markdown-content {
@@ -1143,6 +1260,14 @@
 
   .form-grid {
     grid-template-columns: 1fr;
+  }
+
+  .interview-modes {
+    grid-template-columns: 1fr;
+  }
+
+  .interview-modes fieldset {
+    gap: 10px 14px;
   }
 
   .history-row {

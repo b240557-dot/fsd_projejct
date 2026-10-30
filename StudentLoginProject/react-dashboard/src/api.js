@@ -17,7 +17,9 @@ async function request(path, options = {}) {
       ...options,
       credentials: "include",
       headers: {
-        ...(options.body ? { "Content-Type": "application/json" } : {}),
+        ...(options.body && !(options.body instanceof FormData)
+          ? { "Content-Type": "application/json" }
+          : {}),
         ...options.headers,
       },
     });
@@ -85,6 +87,10 @@ export const api = {
   submitAnswer: (id, values) => request("/api/ai/evaluate-answer", {
     method: "POST",
     body: JSON.stringify({ ...values, interview_id: Number(id) }),
+  }),
+  transcribeAudio: (formData) => request("/api/interviews/transcribe", {
+    method: "POST",
+    body: formData,
   }),
   chat: (values) => request("/api/ai/chat", {
     method: "POST",

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { FileSearch, Sparkles } from "lucide-react";
 import { api } from "./api";
 import MarkdownContent from "./MarkdownContent";
@@ -25,6 +26,7 @@ function AnalysisList({ title, items }) {
 }
 
 function JobDescriptionAnalysis() {
+  const navigate = useNavigate();
   const [jobDescription, setJobDescription] = useState("");
   const [analysis, setAnalysis] = useState(null);
   const [error, setError] = useState("");
@@ -96,6 +98,15 @@ function JobDescriptionAnalysis() {
               <AnalysisList key={field} title={title} items={analysis[field]} />
             ))}
           </div>
+          <button
+            className="primary-btn"
+            type="button"
+            onClick={() => navigate("/practice", {
+              state: { jobDescription, jobContext: analysis },
+            })}
+          >
+            Use this analysis for an interview
+          </button>
         </section>
       )}
     </section>
